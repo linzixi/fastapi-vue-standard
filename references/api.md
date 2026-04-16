@@ -1,3 +1,7 @@
+---
+type: "manual"
+---
+
 # API 编码规范
 
 ## 文件结构与命名
@@ -62,26 +66,23 @@ class ExampleClass:
 ### 导入顺序（必须按顺序）
 ```python
 # 1. 标准库导入
-import re
+import time
 import json
-from datetime import datetime
-from typing import Any
 
 # 2. 第三方库导入
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from flask import request, jsonify, g
+from wtforms import StringField, IntegerField
+from wtforms.validators import DataRequired, Length
 
 # 3. 本地应用导入
-from app.db.session import get_db
+from app.api import api
 from app.libs.logger import logger
-from app.libs.token_auth import get_current_user
-from app.models.user import User
+from app.libs.token_auth import auth
+from app.validators.chat_model import ChatModelForm
 ```
 
 ### 导入最佳实践
-- 避免使用 `from fastapi import *`
+- 避免使用 `from flask import *`
 - 优先使用绝对导入
 - 避免循环导入
 
@@ -91,18 +92,16 @@ from app.models.user import User
 
 ### 1. URL设计原则
 ```python
-router = APIRouter(prefix="/api/v1/user", tags=["User"])
-
 # ✅ 正确示例
-@router.get("/get_user_list")               # 列表查询
-@router.get("/get_user_detail/{user_id}")    # 单个资源
-@router.post("/create_user")                 # 创建资源
-@router.post("/update_user")                 # 更新资源
+@api.route('/api/users')                          # 资源集合
+@api.route('/api/users/<int:user_id>')            # 单个资源
+@api.route('/api/chat_model', methods=['POST'])   # 指定方法
+@api.route('/api/files/<path:file_path>')         # 路径参数
 
 # ❌ 错误示例
-@router.get("/getUsers")                     # URL中避免驼峰
-@router.get("/UserInfo")                     # 避免大小写混用
-@router.get("/get-user-info")               # 避免连字符
+@api.route('/api/getUsers')                       # URL中避免动词
+@api.route('/api/UserInfo')                       # 避免大小写混用
+@api.route('/api/get-user-info')                  # 避免连字符
 ```
 
 ### 2. HTTP方法使用规范
@@ -138,28 +137,27 @@ router = APIRouter(prefix="/api/v1/user", tags=["User"])
 
 ## 认证与权限
 
-### 1. 依赖注入认证
+### 1. 认证装饰器使用
 ```python
-from app.libs.token_auth import get_current_user
+from app.libs.token_auth import auth
 
-@router.get("/get_user_info")
-async def get_user_info(
-    current_user: dict[str, Any] = Depends(get_current_user),
-):
+@api.route('/api/user/info')
+@auth.login_required
+def get_user_info():
     """需要认证的接口"""
-    user_id = current_user.get("uid")
-    return success_response({"user_id": user_id})
+    user_id = g.client.uid
+    return jsonify(user_id=user_id)
 ```
 
 ### 2. 权限控制
 ```python
 from app.libs.scope import is_in_scope
-from fastapi import HTTPException, status
+from app.libs.error_code import Forbidden
 
-def check_permission(scope_name: str, endpoint: str) -> None:
+def check_permission(scope_name, endpoint):
     """检查接口访问权限"""
     if not is_in_scope(scope_name, endpoint):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权限访问")
+        raise Forbidden(msg="无权限访问")
 ```
 
 ---
@@ -170,144 +168,152 @@ def check_permission(scope_name: str, endpoint: str) -> None:
 
 **验证器定义位置**：直接在API接口文件中定义
 
-**继承基类**：所有验证器必须继承 Pydantic `BaseModel`
+**继承基类**：所有验证器必须继承 `BaseForm`
 
 **创建方式**：在API接口文件顶部定义验证器类
 
 ```python
-from __future__ import annotations
 
-import re
-from typing import Any
-
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field, field_validator
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.db.session import get_db
+from flask import request, jsonify, g
+from wtforms import StringField, IntegerField
+from wtforms.validators import DataRequired, Length, ValidationError
+from app.api import api
 from app.libs.logger import logger
-from app.libs.token_auth import get_current_user
+from app.libs.token_auth import auth
+from app.validators.base_form import BaseForm
 
 
 # 验证器定义区域
-class ChatModelForm(BaseModel):
+class ChatModelForm(BaseForm):
     """聊天模型参数验证器"""
-    prompt: str = Field(min_length=1, max_length=6000, description="提示词不能为空")
-    model_name: str | None = Field(
-        default=None, min_length=1, max_length=50, description="模型名称"
-    )
+    prompt = StringField(validators=[
+        DataRequired(message='提示词不能为空'),
+        Length(min=1, max=6000, message='提示词长度应在1-6000个字符之间')
+    ])
+    model_name = StringField(validators=[
+        Length(min=1, max=50, message='模型名称长度应在1-50个字符之间')
+    ])
 
-    @field_validator("model_name")
-    @classmethod
-    def validate_model_name(cls, value: str | None) -> str | None:
+    def validate_model_name(self, field):
         """自定义验证：检查模型名称"""
-        if value is not None:
-            supported_models = ["deepseek", "gemini_pro", "doubao"]
-            if value not in supported_models:
-                raise ValueError(f"不支持的模型: {value}")
-        return value
+        if field.data:
+            supported_models = ['deepseek', 'gemini_pro', 'doubao']
+            if field.data not in supported_models:
+                raise ValidationError(f'不支持的模型: {field.data}')
 
 
 # API接口定义区域
-router = APIRouter(prefix="/api/v1/chat", tags=["Chat"])
-
-
-@router.post("/chat_model")
-async def api_chat_model(
-    payload: ChatModelForm,
-    current_user: dict[str, Any] = Depends(get_current_user),
-):
+@api.route('/api/chat_model', methods=['POST'])
+@auth.login_required
+def api_chat_model():
     """聊天模型接口"""
     # 接口实现...
 ```
 
 ### 2. 验证器使用
 
-**Pydantic 自动验证**：参数通过函数签名声明，FastAPI 自动完成校验，无需手动调用 `validate()`。
+**四步验证流程**：
 
 ```python
-@router.post("/chat_model")
-async def api_chat_model(
-    payload: ChatModelForm,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict[str, Any] = Depends(get_current_user),
-):
+@api.route('/api/chat_model', methods=['POST'])
+@auth.login_required
+def api_chat_model():
     """聊天模型接口"""
     try:
-        # Pydantic 已自动验证，直接获取字段值
-        prompt = payload.prompt
-        model_name = payload.model_name or "deepseek"
+        # 第一步：创建验证器实例
+        form = ChatModelForm()
+
+        # 第二步：执行验证
+        if not form.validate():
+            # 第三步：提取第一个错误信息
+            error_msg = list(form.errors.values())[0][0] if form.errors else '参数错误'
+            return jsonify({
+                "code": 400,
+                "message": error_msg,
+                "data": None
+            }), 400
+
+        # 第四步：获取验证后的参数
+        prompt = form.prompt.data
+        model_name = form.model_name.data or 'deepseek'
 
         # 业务逻辑处理
         logger.info(f"调用模型: {model_name}, 提示词: {prompt[:20]}...")
         # 执行业务逻辑...
 
-        return success_response(data=result)
-    except HTTPException:
-        raise
+        return jsonify({
+            "code": 200,
+            "message": "成功",
+            "data": result
+        })
+    except ValueError as e:
+        logger.warning(f"参数验证失败: {str(e)}")
+        return jsonify({
+            "code": 400,
+            "message": str(e),
+            "data": None
+        }), 400
     except Exception as e:
-        logger.error(f"接口错误: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="服务内部错误",
-        )
+        logger.error(f"接口错误: {str(e)}")
+        return jsonify({
+            "code": 500,
+            "message": "服务内部错误",
+            "data": None
+        }), 500
 ```
 
 ### 3. 常用验证规则
 
-| 验证方式 | 用途 | 示例 |
+| 验证器 | 用途 | 示例 |
 |--------|------|------|
-| `Field(min_length=, max_length=)` | 字符串长度验证 | `Field(min_length=1, max_length=100)` |
-| `Field(ge=, le=)` | 数值范围验证 | `Field(ge=1, le=100)` |
-| `Field(gt=0)` | 必须大于零 | `user_id: int = Field(gt=0)` |
-| `EmailStr` | 邮箱格式验证 | `email: EmailStr` |
-| `field_validator` | 自定义验证 | `@field_validator("username")` |
-| `Field(pattern=...)` | 正则验证 | `Field(pattern=r"^[a-zA-Z0-9]+$")` |
+| DataRequired | 必填验证 | `DataRequired(message='字段不能为空')` |
+| Length | 长度验证 | `Length(min=1, max=100, message='长度应在1-100之间')` |
+| Email | 邮箱验证 | `Email(message='邮箱格式不正确')` |
+| Regexp | 正则验证 | `Regexp(r'^[a-zA-Z0-9]+$', message='只能包含字母和数字')` |
+| NumberRange | 数值范围 | `NumberRange(min=1, max=100, message='数值应在1-100之间')` |
+| 自定义验证 | validate_字段名 | `def validate_username(self, field)` |
 
 ### 4. 自定义验证方法示例
 
 ```python
-from enum import IntEnum
-
-from pydantic import BaseModel, EmailStr, Field, field_validator
-
-
-class MemberTypeEnum(IntEnum):
-    NORMAL = 1
-    VIP = 2
-    SVIP = 3
-
-
-class MemberForm(BaseModel):
+class MemberForm(BaseForm):
     """会员参数验证器"""
-    account: str = Field(min_length=5, max_length=32, description="账号不允许为空")
-    type: int = Field(description="类型不能为空")
+    account = StringField(validators=[
+        DataRequired(message='账号不允许为空'),
+        Length(min=5, max=32, message='账号长度应在5-32个字符之间')
+    ])
+    type = IntegerField(validators=[DataRequired(message='类型不能为空')])
 
-    @field_validator("type")
-    @classmethod
-    def validate_type(cls, value: int) -> int:
+    def validate_type(self, field):
         """自定义验证：验证会员类型枚举"""
         try:
-            MemberTypeEnum(value)
-        except ValueError:
-            raise ValueError(f"无效的会员类型: {value}")
-        return value
+            member_type = MemberTypeEnum(field.data)
+            # 验证通过后可以转换数据类型
+            self.type.data = member_type
+        except ValueError as e:
+            raise ValidationError(f'无效的会员类型: {field.data}')
 
 
-class CreateUserForm(BaseModel):
+class CreateUserForm(BaseForm):
     """创建用户验证器"""
-    username: str = Field(min_length=3, max_length=20, description="用户名不能为空")
-    email: EmailStr
-    password: str = Field(min_length=6, max_length=32, description="密码不能为空")
+    username = StringField(validators=[
+        DataRequired(message='用户名不能为空'),
+        Length(min=3, max=20, message='用户名长度应在3-20个字符之间')
+    ])
+    email = StringField(validators=[
+        DataRequired(message='邮箱不能为空'),
+        Email(message='邮箱格式不正确')
+    ])
+    password = StringField(validators=[
+        DataRequired(message='密码不能为空'),
+        Length(min=6, max=32, message='密码长度应在6-32个字符之间')
+    ])
 
-    @field_validator("username")
-    @classmethod
-    def validate_username(cls, value: str) -> str:
+    def validate_username(self, field):
         """自定义验证：检查用户名格式"""
         import re
-        if not re.match(r"^[a-zA-Z0-9_]+$", value):
-            raise ValueError("用户名只能包含字母、数字和下划线")
-        return value
+        if not re.match(r'^[a-zA-Z0-9_]+$', field.data):
+            raise ValidationError('用户名只能包含字母、数字和下划线')
 ```
 
 ### 5. 文件组织结构
@@ -315,60 +321,41 @@ class CreateUserForm(BaseModel):
 **推荐的API文件结构**：
 
 ```python
+
 # ========== 第一部分：导入区域 ==========
-from __future__ import annotations
-
-from typing import Any
-
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.db.session import get_db
+from flask import request, jsonify, g
+from wtforms import StringField
+from wtforms.validators import DataRequired, Length, Email
+from app.api import api
 from app.libs.logger import logger
-from app.libs.token_auth import get_current_user
+from app.libs.token_auth import auth
+from app.validators.base_form import BaseForm
 from app.models.user import User
 
 # ========== 第二部分：验证器定义区域 ==========
-class CreateUserForm(BaseModel):
+class CreateUserForm(BaseForm):
     """创建用户验证器"""
-    username: str = Field(min_length=3, max_length=20)
-    email: EmailStr
-    password: str = Field(min_length=6, max_length=32)
+    username = StringField(validators=[DataRequired(), Length(min=3, max=20)])
+    email = StringField(validators=[DataRequired(), Email()])
+    password = StringField(validators=[DataRequired(), Length(min=6, max=32)])
 
-# ========== 第三部分：响应模型与辅助函数区域 ==========
-class UserRead(BaseModel):
-    """用户响应模型"""
-    id: int
-    username: str
-    email: EmailStr
-
-    model_config = ConfigDict(from_attributes=True)
-
-def success_response(data: Any = None, message: str = "成功", code: int = 200) -> dict[str, Any]:
+# ========== 第三部分：辅助函数区域 ==========
+def success_response(data=None, message="成功"):
     """统一成功响应"""
-    return {"code": code, "message": message, "data": data}
+    return jsonify({"code": 200, "message": message, "data": data})
 
-# ========== 第四部分：路由与接口区域 ==========
-router = APIRouter(prefix="/api/v1/user", tags=["User"])
-
-@router.get("/get_user_list")
-async def get_user_list(
-    page: int = Query(1, ge=1),
-    per_page: int = Query(20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db),
-    current_user: dict[str, Any] = Depends(get_current_user),
-):
+# ========== 第四部分：API路由区域 ==========
+@api.route('/api/users', methods=['GET'])
+@auth.login_required
+def get_users():
     """获取用户列表"""
     # 实现代码...
 
-@router.post("/create_user")
-async def create_user(
-    payload: CreateUserForm,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict[str, Any] = Depends(get_current_user),
-):
+@api.route('/api/users', methods=['POST'])
+@auth.login_required
+def create_user():
     """创建新用户"""
+    form = CreateUserForm()
     # 实现代码...
 ```
 
@@ -381,89 +368,104 @@ async def create_user(
 **三层异常处理结构**：
 
 ```python
-@router.post("/chat_model")
-async def api_chat_model(
-    payload: ChatModelForm,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict[str, Any] = Depends(get_current_user),
-):
+@api.route('/api/chat_model', methods=['POST'])
+@auth.login_required
+def api_chat_model():
     try:
+        # 业务逻辑
+        form = ChatModelForm()
+
+        if not form.validate():
+            error_msg = list(form.errors.values())[0][0] if form.errors else '参数错误'
+            return jsonify({
+                "code": 400,
+                "message": error_msg,
+                "data": None
+            }), 400
+
         # 执行业务逻辑
-        result = await process_business_logic(payload, db)
+        result = process_business_logic()
 
-        return success_response(data=result)
+        return jsonify({
+            "code": 200,
+            "message": "成功",
+            "data": result
+        })
 
-    # 第一层：FastAPI HTTP 异常（参数错误、资源不存在等）
-    except HTTPException:
-        raise
+    # 第一层：参数验证错误
+    except ValueError as e:
+        logger.warning(f"参数验证失败: {str(e)}")
+        return jsonify({
+            "code": 400,
+            "message": str(e),
+            "data": None
+        }), 400
 
-    # 第二层：业务逻辑异常
+    # 第二层：业务逻辑错误
     except BusinessException as e:
         logger.warning(f"业务异常: {str(e)}")
-        raise HTTPException(status_code=e.code, detail=e.message)
+        return jsonify({
+            "code": e.code,
+            "message": e.message,
+            "data": None
+        }), e.code
 
     # 第三层：系统异常
     except Exception as e:
         logger.error(f"系统错误: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="服务内部错误",
-        )
+        return jsonify({
+            "code": 500,
+            "message": "服务内部错误",
+            "data": None
+        }), 500
 ```
 
 ### 2. HTTP状态码使用规范
 
-| 状态码 | 场景 | 返回方式 |
+| 状态码 | 场景 | 返回示例 |
 |--------|------|---------|
-| 200 | 请求成功 | `return success_response(data)` |
-| 201 | 创建成功 | `return success_response(data, "创建成功", 201)` |
-| 400 | 参数错误 | `raise HTTPException(status_code=400, detail="参数错误")` |
-| 401 | 未认证 | `raise HTTPException(status_code=401, detail="未认证")` |
-| 403 | 权限不足 | `raise HTTPException(status_code=403, detail="权限不足")` |
-| 404 | 资源不存在 | `raise HTTPException(status_code=404, detail="资源不存在")` |
-| 500 | 服务器错误 | `raise HTTPException(status_code=500, detail="服务内部错误")` |
+| 200 | 请求成功 | `return jsonify({...})` |
+| 201 | 创建成功 | `return jsonify({...}), 201` |
+| 400 | 参数错误 | `return jsonify({...}), 400` |
+| 401 | 未认证 | `return jsonify({...}), 401` |
+| 403 | 权限不足 | `return jsonify({...}), 403` |
+| 404 | 资源不存在 | `return jsonify({...}), 404` |
+| 500 | 服务器错误 | `return jsonify({...}), 500` |
 
 ### 3. 自定义异常类
 
 ```python
 # app/libs/error_code.py
-from fastapi import HTTPException, status
-
-
-class APIException(HTTPException):
+class APIException(Exception):
     """API异常基类"""
-    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-    detail = "服务器异常"
+    code = 500
+    msg = '服务器异常'
 
-    def __init__(self, detail: str | None = None, status_code: int | None = None):
-        super().__init__(
-            status_code=status_code or self.__class__.status_code,
-            detail=detail or self.__class__.detail,
-        )
-
+    def __init__(self, msg=None, code=None):
+        if msg:
+            self.msg = msg
+        if code:
+            self.code = code
 
 class ParameterException(APIException):
     """参数异常"""
-    status_code = status.HTTP_400_BAD_REQUEST
-    detail = "参数错误"
-
+    code = 400
+    msg = '参数错误'
 
 class AuthFailed(APIException):
     """认证失败"""
-    status_code = status.HTTP_401_UNAUTHORIZED
-    detail = "认证失败"
-
+    code = 401
+    msg = '认证失败'
 
 class Forbidden(APIException):
     """权限不足"""
-    status_code = status.HTTP_403_FORBIDDEN
-    detail = "权限不足"
-
+    code = 403
+    msg = '权限不足'
 
 class NotFound(APIException):
     """资源不存在"""
-    status_code = status.HTTP_404_NOT_FOUND
-    detail = "资源不存在"
+    code = 404
+    msg = '资源不存在'
 ```
 
 ---
@@ -474,40 +476,53 @@ class NotFound(APIException):
 
 **单条数据响应**：
 ```python
-return success_response({
-    "content": "你好！有什么我可以帮助你的吗？",
-    "model_name": "deepseek",
-    "finish_reason": "stop",
-    "input_tokens": 10,
-    "output_tokens": 15,
+return jsonify({
+    "code": 200,
+    "message": "成功",
+    "data": {
+        "content": "你好！有什么我可以帮助你的吗？",
+        "model_name": "deepseek",
+        "finish_reason": "stop",
+        "input_tokens": 10,
+        "output_tokens": 15
+    }
 })
 ```
 
 **列表数据响应**：
 ```python
-return success_response({
-    "total": 100,
-    "page": 1,
-    "per_page": 20,
-    "items": [
-        {"id": 1, "name": "item1"},
-        {"id": 2, "name": "item2"},
-    ],
+return jsonify({
+    "code": 200,
+    "message": "成功",
+    "data": {
+        "total": 100,
+        "page": 1,
+        "per_page": 20,
+        "items": [
+            {"id": 1, "name": "item1"},
+            {"id": 2, "name": "item2"}
+        ]
+    }
 })
 ```
 
 **无返回数据响应**：
 ```python
-return success_response(None, "操作成功")
+return jsonify({
+    "code": 200,
+    "message": "操作成功",
+    "data": None
+})
 ```
 
 ### 2. 错误响应标准格式
 
 ```python
-raise HTTPException(
-    status_code=status.HTTP_400_BAD_REQUEST,
-    detail="参数验证失败：提示词不能为空",
-)
+return jsonify({
+    "code": 400,
+    "message": "参数验证失败：提示词不能为空",
+    "data": None
+}), 400
 ```
 
 ### 3. 响应格式规范要点
@@ -527,13 +542,13 @@ raise HTTPException(
 from app.libs.logger import logger
 
 # INFO - 重要业务操作
-logger.info("[API] 调用模型: %s, 用户: %s, 提示词长度: %s", model_name, user_id, len(prompt))
+logger.info(f"[API] 调用模型: {model_name}, 用户: {user_id}, 提示词长度: {len(prompt)}")
 
 # WARNING - 警告信息（可预期的异常）
-logger.warning("[Validation] 参数验证失败: %s, 用户: %s", error_msg, user_id)
+logger.warning(f"[Validation] 参数验证失败: {error_msg}, 用户: {user_id}")
 
 # ERROR - 错误信息（系统异常）
-logger.error("[System] 接口异常: %s", str(e), exc_info=True)
+logger.error(f"[System] 接口异常: {str(e)}, 路径: {request.path}", exc_info=True)
 ```
 
 ### 2. 日志格式规范
@@ -542,9 +557,9 @@ logger.error("[System] 接口异常: %s", str(e), exc_info=True)
 
 ```python
 # ✅ 正确示例
-logger.info("[API] GET /api/v1/user/get_user_list - 用户: %s - 耗时: %sms", user_id, elapsed)
-logger.error("[DB] 数据库查询失败 - SQL: %s - 错误: %s", sql, error)
-logger.warning("[Auth] Token验证失败 - Token: %s... - IP: %s", token[:10], client_ip)
+logger.info(f"[API] {request.method} {request.path} - 用户: {user_id} - 耗时: {elapsed}ms")
+logger.error(f"[DB] 数据库查询失败 - SQL: {sql} - 错误: {error}")
+logger.warning(f"[Auth] Token验证失败 - Token: {token[:10]}... - IP: {request.remote_addr}")
 
 # ❌ 错误示例
 logger.info("error")              # 信息不明确
@@ -568,11 +583,9 @@ logger.warning("失败")            # 没有详细信息
 使用 `@@@` 包裹的 Markdown 格式文档：
 
 ```python
-@router.post("/chat_model")
-async def api_chat_model(
-    payload: ChatModelForm,
-    current_user: dict[str, Any] = Depends(get_current_user),
-):
+@api.route('/api/chat_model', methods=['POST'])
+@auth.login_required
+def api_chat_model():
     """
     聊天模型接口
     @@@
@@ -608,7 +621,7 @@ async def api_chat_model(
 
     #### 备注
     - 请求方式：POST Raw JSON
-    - 接口地址：http://127.0.0.1:8000/api/v1/chat/chat_model
+    - 接口地址：http://127.0.0.1:5000/api/v1/chat_model
     - 超时时间：30秒
     @@@
     """
@@ -618,7 +631,7 @@ async def api_chat_model(
 ### 2. 函数注释规范
 
 ```python
-def generate_auth_token(uid: int, scope: str | None = None, expiration: int = 7200) -> str:
+def generate_auth_token(uid, scope=None, expiration=7200):
     """生成认证令牌
 
     为用户生成用于API认证的JWT令牌。
@@ -652,19 +665,19 @@ def generate_auth_token(uid: int, scope: str | None = None, expiration: int = 72
 **单一职责（Single Responsibility）**：
 ```python
 # ✅ 正确：每个接口只负责一个功能
-@router.get("/get_user_list")
-async def get_user_list():
+@api.route('/api/users', methods=['GET'])
+def get_users():
     """获取用户列表"""
     pass
 
-@router.post("/create_user")
-async def create_user():
+@api.route('/api/users', methods=['POST'])
+def create_user():
     """创建新用户"""
     pass
 
 # ❌ 错误：一个接口承担多个职责
-@router.api_route("/users", methods=["GET", "POST", "DELETE"])
-async def handle_users():
+@api.route('/api/users', methods=['GET', 'POST', 'DELETE'])
+def handle_users():
     """处理所有用户操作"""
     pass
 ```
@@ -672,105 +685,59 @@ async def handle_users():
 **接口隔离（Interface Segregation）**：
 ```python
 # ✅ 正确：精确的接口定义
-@router.get("/get_user_profile")
-async def get_user_profile():
+@api.route('/api/user/profile', methods=['GET'])
+def get_user_profile():
     """获取用户资料"""
     pass
 
-@router.get("/get_user_settings")
-async def get_user_settings():
+@api.route('/api/user/settings', methods=['GET'])
+def get_user_settings():
     """获取用户设置"""
     pass
 
 # ❌ 错误：返回过多不必要的数据
-@router.get("/get_user_all_data")
-async def get_user_all_data():
+@api.route('/api/user/all', methods=['GET'])
+def get_user_all_data():
     """返回用户所有数据（包括不需要的）"""
     pass
-```
-
-### 2. 响应模型与ORM转换
-
-**使用 `ConfigDict(from_attributes=True)` 支持 ORM 对象直接转换**：
-```python
-from pydantic import BaseModel, ConfigDict
-
-class UserRead(BaseModel):
-    """用户响应模型"""
-    id: int
-    username: str
-    email: str
-    created_at: datetime | None = None
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-@router.get("/get_user_detail/{user_id}")
-async def get_user_detail(
-    user_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict[str, Any] = Depends(get_current_user),
-):
-    """获取用户详情"""
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
-
-    return success_response(UserRead.model_validate(user).model_dump())
 ```
 
 ### 3. 性能优化
 
 **使用分页**：
 ```python
-@router.get("/get_user_list")
-async def get_user_list(
-    page: int = Query(1, ge=1, description="页码"),
-    per_page: int = Query(20, ge=1, le=100, description="每页数量"),
-    keyword: str = Query("", description="搜索关键词"),
-    db: AsyncSession = Depends(get_db),
-    current_user: dict[str, Any] = Depends(get_current_user),
-):
+@api.route('/api/users', methods=['GET'])
+def get_users():
     """获取用户列表（分页）"""
-    stmt = select(User)
-    if keyword.strip():
-        stmt = stmt.where(User.username.like(f"%{keyword.strip()}%"))
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
 
-    total_stmt = select(func.count()).select_from(stmt.subquery())
-    total_result = await db.execute(total_stmt)
-    total = total_result.scalar_one()
-
-    result = await db.execute(stmt.offset((page - 1) * per_page).limit(per_page))
-    users = result.scalars().all()
+    pagination = User.query.paginate(page=page, per_page=per_page)
 
     return success_response({
-        "total": total,
+        "total": pagination.total,
         "page": page,
         "per_page": per_page,
-        "items": [UserRead.model_validate(u).model_dump() for u in users],
+        "items": [u.to_dict() for u in pagination.items]
     })
 ```
 
 **避免 N+1 查询**：
 ```python
-from sqlalchemy.orm import selectinload
+# ✅ 正确：使用 joinedload
+from sqlalchemy.orm import joinedload
 
-# ✅ 正确：使用 selectinload
-@router.get("/get_article_list")
-async def get_article_list(db: AsyncSession = Depends(get_db)):
+@api.route('/api/articles', methods=['GET'])
+def get_articles():
     """获取文章列表（包含作者信息）"""
-    stmt = select(Article).options(selectinload(Article.author))
-    result = await db.execute(stmt)
-    articles = result.scalars().all()
+    articles = Article.query.options(joinedload(Article.author)).all()
     return success_response([a.to_dict() for a in articles])
 
 # ❌ 错误：N+1 查询
-@router.get("/get_article_list_bad")
-async def get_article_list_bad(db: AsyncSession = Depends(get_db)):
+@api.route('/api/articles', methods=['GET'])
+def get_articles_with_n_plus_one():
     """获取文章列表（N+1问题）"""
-    result = await db.execute(select(Article))
-    articles = result.scalars().all()
+    articles = Article.query.all()
     # 每次循环都会触发一次数据库查询
     return success_response([
         {**a.to_dict(), "author": a.author.to_dict()}
@@ -782,26 +749,19 @@ async def get_article_list_bad(db: AsyncSession = Depends(get_db)):
 
 **SQL注入防护**：
 ```python
-# ✅ 正确：使用 SQLAlchemy ORM 参数化查询
-@router.get("/search_users")
-async def search_users(
-    keyword: str = Query("", description="搜索关键词"),
-    db: AsyncSession = Depends(get_db),
-):
-    stmt = select(User).where(User.name.like(f"%{keyword}%"))
-    result = await db.execute(stmt)
-    users = result.scalars().all()
+# ✅ 正确：使用参数化查询
+@api.route('/api/users/search', methods=['GET'])
+def search_users():
+    keyword = request.args.get('keyword', '')
+    users = User.query.filter(User.name.like(f'%{keyword}%')).all()
     return success_response([u.to_dict() for u in users])
 
 # ❌ 错误：直接拼接SQL
-@router.get("/search_users_unsafe")
-async def search_users_unsafe(
-    keyword: str = Query(""),
-    db: AsyncSession = Depends(get_db),
-):
+@api.route('/api/users/search', methods=['GET'])
+def search_users_unsafe():
+    keyword = request.args.get('keyword', '')
     sql = f"SELECT * FROM users WHERE name LIKE '%{keyword}%'"
-    result = await db.execute(text(sql))
-    users = result.fetchall()
+    users = db.session.execute(sql).fetchall()
     return success_response(users)
 ```
 
@@ -818,28 +778,25 @@ async def search_users_unsafe(
 - [ ] 函数和类之间有适当的空行
 
 ### 接口设计
-- [ ] URL命名符合规范（小写、下划线、动词+对象风格）
-- [ ] HTTP方法使用正确（GET查询、POST变更）
-- [ ] 所有API路由以 `/api/v1` 开头，通过 `APIRouter(prefix=...)` 配置
+- [ ] URL命名符合RESTful规范（小写、下划线、无动词）
+- [ ] HTTP方法使用正确（GET查询、POST创建、PUT更新、DELETE删除）
+- [ ] 所有API路由以 `/api` 开头
 
 ### 参数验证
-- [ ] 在API文件顶部创建了对应的 Pydantic 验证器（继承 `BaseModel`）
-- [ ] 验证器定义在导入区域之后、路由定义之前
-- [ ] 所有必填参数使用了 `Field(...)` 约束
-- [ ] GET 查询参数使用 `Query(...)` 声明
-- [ ] POST 请求体使用 Pydantic 模型声明（`payload: XxxForm`）
+- [ ] 在API文件顶部创建了对应的Form验证器（继承BaseForm）
+- [ ] 验证器定义在导入区域之后、接口定义之前
+- [ ] 所有必填参数使用了 `DataRequired` 验证器
 - [ ] 验证错误信息清晰明确
-- [ ] 文件结构清晰：导入→验证器→响应模型→辅助函数→路由
+- [ ] 文件结构清晰：导入→验证器→辅助函数→API路由
 
 ### 认证与权限
-- [ ] 需要认证的接口添加了 `Depends(get_current_user)` 依赖
+- [ ] 需要认证的接口添加了 `@auth.login_required` 装饰器
 - [ ] 权限检查逻辑正确实现
 
 ### 错误处理
-- [ ] 实现了三层异常捕获（HTTPException、BusinessException、Exception）
+- [ ] 实现了三层异常捕获（ValueError、BusinessException、Exception）
 - [ ] HTTP状态码使用正确（200/400/401/403/404/500）
 - [ ] 错误信息对用户友好且不泄露敏感信息
-- [ ] 异常统一通过 `raise HTTPException(...)` 抛出
 
 ### 响应格式
 - [ ] 所有响应包含 `code`、`message`、`data` 三个字段
@@ -860,8 +817,8 @@ async def search_users_unsafe(
 ### 性能与安全
 - [ ] 使用了参数化查询，避免SQL注入
 - [ ] 列表接口实现了分页
-
 ---
+
 
 ## 注意
 - 不要生成单独的接口文档及API 使用指南

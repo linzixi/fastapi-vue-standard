@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# @Author   : justin.郑
-# @mail     : 3907721@qq.com
+# @Author   : ****
 # @Time     : 2026/1/6 10:00
 # @File     : user_api.py
 # @Desc     : 用户管理API接口（FastAPI示例，仅GET/POST）
